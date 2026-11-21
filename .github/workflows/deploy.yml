@@ -1,0 +1,117 @@
+# Vendora: test, build and deploy on every push to main.
+#
+#   1. test   : backend tests (in-memory MongoDB, no real database touched)
+#   2. web    : frontend lint + production build (proves it builds)
+#   3. deploy : only if both pass, SSH into the server: pull, install, restart the API with PM2,
+#               rebuild the web app (served by Nginx). See DEPLOYMENT.md, Option A.
+#
+# One-time setup in GitHub → Settings → Secrets and variables → Actions:
+#   Secrets  : SSH_HOST, SSH_USER, SSH_PRIVATE_KEY (a deploy key for that user), SSH_PORT (optional, default 22)
+#   Variables: APP_DIR (e.g. /var/www/vendora), APP_URL (e.g. https://shop.example.com),
+#              VITE_PAYMENT_UPI_ID (public UPI ID shown at checkout)
+# The server keeps its own backend/.env; no app secret ever passes through GitHub.
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: # "Run workflow" button for a manual deploy
+
+# Never run two deploys at once; a newer push waits for the running one.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Backend tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - run: npm test
+
+  web:
+    name: Frontend lint and build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+
+  deploy:
+    name: Deploy to server
+    needs: [test, web]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    steps:
+      - name: Pull, install, restart
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          APP_DIR: ${{ vars.APP_DIR }}
+          VITE_PAYMENT_UPI_ID: ${{ vars.VITE_PAYMENT_UPI_ID }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: APP_DIR,VITE_PAYMENT_UPI_ID
+          script_stop: true
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+
+            echo "→ Pulling the latest code"
+            git fetch --prune origin main
+            git reset --hard origin/main
+
+            echo "→ API: install and restart"
+            cd backend
+            npm ci --omit=dev
+            pm2 restart vendora-api --update-env || pm2 start src/server.js --name vendora-api
+            pm2 save
+
+            echo "→ Web app: build (Nginx serves frontend/dist)"
+            cd ../frontend
+            npm ci
+            # Build next to the live folder, then swap, so visitors never hit a half-built site.
+            VITE_PAYMENT_UPI_ID="$VITE_PAYMENT_UPI_ID" npm run build -- --outDir dist-next --emptyOutDir
+            rm -rf dist-old
+            if [ -d dist ]; then mv dist dist-old; fi
+            mv dist-next dist
+            rm -rf dist-old
+
+      - name: Health check
+        run: |
+          for attempt in 1 2 3 4 5 6; do
+            if curl -fsS "${{ vars.APP_URL }}/api/v1/health"; then echo; echo "API is up"; exit 0; fi
+            echo "Not up yet (attempt $attempt), waiting…"; sleep 10
+          done
+          echo "Health check failed: see 'pm2 logs vendora-api' on the server" >&2
+          exit 1
